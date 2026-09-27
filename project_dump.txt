@@ -1,0 +1,402 @@
+# Дамп проекта: Рабочий бот
+# Создан: 2026-09-25 16:41:54
+# Файлов: 7
+#======================================================================
+
+
+#======================================================================
+# FILE: bus.json
+#======================================================================
+{
+  "total": 1,
+  "last": {
+    "id": 3586,
+    "peer_id": 429855373,
+    "from_id": 429855373,
+    "conversation_message_id": 1179,
+    "from_name": "Кирилл Рунков",
+    "text": "попа",
+    "attachments": [],
+    "reply_message": null,
+    "fwd_messages": [],
+    "payload": null,
+    "geo": null,
+    "date": 1790268591,
+    "date_str": "2026-09-24 19:49:51",
+    "out": 0,
+    "important": false,
+    "is_cropped": false
+  },
+  "messages": [
+    {
+      "id": 3586,
+      "peer_id": 429855373,
+      "from_id": 429855373,
+      "conversation_message_id": 1179,
+      "from_name": "Кирилл Рунков",
+      "text": "попа",
+      "attachments": [],
+      "reply_message": null,
+      "fwd_messages": [],
+      "payload": null,
+      "geo": null,
+      "date": 1790268591,
+      "date_str": "2026-09-24 19:49:51",
+      "out": 0,
+      "important": false,
+      "is_cropped": false
+    }
+  ]
+}
+
+
+#======================================================================
+# FILE: config.py
+#======================================================================
+﻿# config.py — настройки проекта
+import os
+from dotenv import load_dotenv
+
+# Загружаем переменные из .env (файл лежит рядом с config.py)
+load_dotenv()
+
+# --- секреты (берутся из .env) ---
+VK_TOKEN = os.getenv("VK_TOKEN")
+if not VK_TOKEN:
+    raise RuntimeError("VK_TOKEN не задан. Проверь файл .env")
+
+_vk_group_raw = os.getenv("VK_GROUP_ID", "").strip()
+# None для личных сообщений, или int ID группы
+VK_GROUP_ID = int(_vk_group_raw) if _vk_group_raw else None
+
+# --- обычные настройки (не секреты) ---
+POLL_WAIT = 25           # сколько секунд LongPoll ждёт сообщения
+RESOLVE_NAMES = True     # тянуть ли имя отправителя через users.get
+
+# --- отладка ---
+BUS_FILE = "bus.json"    # куда писать снимок шины (None — отключить)
+BUS_MAX_MESSAGES = 50    # сколько последних сообщений писать в файл
+
+
+#======================================================================
+# FILE: main.py
+#======================================================================
+﻿import logging
+import config
+from orchestrator import step
+from modules import bus
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+def main():
+    logging.info("Запуск")
+
+    # начальный пустой снимок шины
+    bus.dump(config.BUS_FILE, config.BUS_MAX_MESSAGES)
+
+    try:
+        while True:
+            step(config)
+            bus.dump(config.BUS_FILE, config.BUS_MAX_MESSAGES)
+    except KeyboardInterrupt:
+        logging.info("Остановка по Ctrl+C")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+#======================================================================
+# FILE: modules/__init__.py
+#======================================================================
+﻿# modules package
+
+
+
+#======================================================================
+# FILE: modules/bus.py
+#======================================================================
+﻿"""Общая шина: переменные, которые видят все модули.
+
+Схему данных смотри в том модуле, который их сюда кладёт:
+    bus.messages  ← modules/vk.py (шаг vk.step)
+    bus.last      ← modules/vk.py
+    bus.total     ← modules/vk.py
+
+Правила:
+  1. Списки мутируй (append/pop), не переприсваивай.
+  2. Не храни в шине тяжёлое (файлы, соединения).
+  3. Оркестратор в шину не пишет — только модули.
+"""
+import json
+
+messages = []      # очередь новых сообщений из VK
+last = None        # последнее полученное сообщение
+total = 0          # счётчик всех сообщений за запуск
+
+
+def dump(path="bus.json", max_messages=50):
+    """Сохраняет снимок шины в JSON-файл. Для наблюдения в прямом эфире."""
+    if not path:
+        return
+
+    snapshot = {
+        "total": total,
+        "last": last,
+        "messages": messages[-max_messages:] if messages else [],
+    }
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        # отладка не должна ронять основной поток
+        pass
+
+
+
+#======================================================================
+# FILE: modules/vk.py
+#======================================================================
+﻿"""VK-модуль. Читает сообщения через LongPoll и кладёт их в bus.
+
+============================================================
+КОНТРАКТ: ЧТО ЭТОТ МОДУЛЬ КЛАДЁТ В ШИНУ
+============================================================
+
+bus.messages : list[dict]
+    Очередь новых сообщений. Новые добавляются в конец.
+    Каждый элемент — dict по схеме ниже.
+
+bus.last : dict | None
+    Последнее полученное сообщение (тот же объект, что messages[-1]).
+    None, если сообщений ещё не было.
+
+bus.total : int
+    Сколько всего сообщений получено за запуск.
+
+
+------------------------------------------------------------
+СХЕМА СООБЩЕНИЯ (элемент bus.messages)
+------------------------------------------------------------
+
+ИДЕНТИФИКАТОРЫ
+    id                          int    ID сообщения в VK
+    peer_id                     int    ID диалога, куда отвечать
+                                       (>0 — пользователь, >2e9 — беседа)
+    from_id                     int    ID отправителя
+                                       (>0 — пользователь, <0 — сообщество)
+    conversation_message_id     int    ID сообщения внутри диалога
+
+КТО ПИШЕТ
+    from_name                   str | None   "Имя Фамилия" отправителя.
+                                             None, если RESOLVE_NAMES=False
+                                             или имя получить не удалось.
+
+ЧТО ПИШЕТ
+    text                        str    текст (может быть пустым)
+    attachments                 list   вложения (фото, документы, аудио) —
+                                       сырой список VK
+    reply_message               dict | None   сообщение, на которое отвечают
+    fwd_messages                list   пересланные сообщения
+    payload                     str | None    payload от кнопки клавиатуры
+    geo                         dict | None   геометка
+
+КОГДА
+    date                        int    Unix-timestamp отправки
+    date_str                    str    "YYYY-MM-DD HH:MM:SS" (локальное)
+
+СЛУЖЕБНОЕ
+    out                         int    1 = исходящее, 0 = входящее
+    important                   bool   помечено ли важным
+    is_cropped                  bool   обрезано ли сообщение
+
+
+============================================================
+ЧТО МОДУЛЬ УМЕЕТ СЕЙЧАС
+============================================================
+  [+] читать новые сообщения (личные или сообщества)
+  [+] разбирать их на поля по схеме выше
+  [+] тянуть имя отправителя через users.get (с кэшем)
+  [+] пересоздавать LongPoll при ошибке
+  [-] отправлять сообщения — добавим отдельным шагом позже
+  [-] реагировать на другие события — добавим по мере надобности
+"""
+import logging
+import time
+import requests
+
+from modules import bus
+
+log = logging.getLogger(__name__)
+
+API_VERSION = "5.199"
+API_URL = "https://api.vk.com/method/"
+
+_session = requests.Session()
+
+_state = {
+    "server": None,
+    "key": None,
+    "ts": None,
+}
+
+_names_cache = {}   # {user_id: "Имя Фамилия"}
+
+
+# ------------------------------------------------------------
+# низкоуровневые вызовы VK API
+# ------------------------------------------------------------
+def _call(config, method, **params):
+    params.update(access_token=config.VK_TOKEN, v=API_VERSION)
+    data = _session.get(API_URL + method, params=params, timeout=15).json()
+    if "error" in data:
+        raise RuntimeError(f"VK API error: {data['error']}")
+    return data["response"]
+
+
+def _init_longpoll(config):
+    if config.VK_GROUP_ID:
+        d = _call(config, "groups.getLongPollServer", group_id=config.VK_GROUP_ID)
+    else:
+        d = _call(config, "messages.getLongPollServer", need_pts=1, lp_version=3)
+    _state["server"] = d["server"]
+    _state["key"] = d["key"]
+    _state["ts"] = d["ts"]
+    log.info("VK LongPoll инициализирован")
+
+
+def _resolve_name(config, user_id):
+    if user_id in _names_cache:
+        return _names_cache[user_id]
+
+    try:
+        result = _call(config, "users.get", user_ids=user_id)
+        if result:
+            u = result[0]
+            name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+            _names_cache[user_id] = name
+            return name
+    except Exception as e:
+        log.warning("Не удалось получить имя для %s: %s", user_id, e)
+
+    _names_cache[user_id] = None
+    return None
+
+
+# ------------------------------------------------------------
+# разбор апдейта VK -> dict по схеме из докстринга
+# ------------------------------------------------------------
+def _format_message(config, obj):
+    from_id = obj.get("from_id")
+    date = obj.get("date")
+
+    date_str = None
+    if date:
+        date_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(date))
+
+    from_name = None
+    if config.RESOLVE_NAMES and from_id and from_id > 0:
+        from_name = _resolve_name(config, from_id)
+
+    return {
+        "id": obj.get("id"),
+        "peer_id": obj.get("peer_id"),
+        "from_id": from_id,
+        "conversation_message_id": obj.get("conversation_message_id"),
+
+        "from_name": from_name,
+
+        "text": obj.get("text", ""),
+        "attachments": obj.get("attachments", []),
+        "reply_message": obj.get("reply_message"),
+        "fwd_messages": obj.get("fwd_messages", []),
+        "payload": obj.get("payload"),
+        "geo": obj.get("geo"),
+
+        "date": date,
+        "date_str": date_str,
+
+        "out": obj.get("out", 0),
+        "important": obj.get("important", False),
+        "is_cropped": obj.get("is_cropped", False),
+    }
+
+
+def _parse_updates(config, updates):
+    out = []
+    for u in updates:
+        utype = u.get("type")
+        obj = u.get("object", {})
+
+        if utype == "message_new":
+            if "message" in obj:
+                obj = obj["message"]
+        elif utype == "message_reply":
+            pass
+        else:
+            continue
+
+        out.append(_format_message(config, obj))
+    return out
+
+
+# ------------------------------------------------------------
+# публичный шаг модуля
+# ------------------------------------------------------------
+def step(config):
+    """ОДИН шаг: забрать новые сообщения из VK и положить в bus.
+
+    Ничего не возвращает. Всё кладёт в bus.messages / bus.last / bus.total.
+    """
+    if _state["ts"] is None:
+        _init_longpoll(config)
+
+    data = _session.get(_state["server"], params={
+        "act": "a_check",
+        "key": _state["key"],
+        "ts": _state["ts"],
+        "wait": config.POLL_WAIT,
+        "mode": 2,
+    }, timeout=config.POLL_WAIT + 10).json()
+
+    if "failed" in data:
+        if data["failed"] == 1:
+            _state["ts"] = data["ts"]
+        else:
+            _init_longpoll(config)
+        return
+
+    _state["ts"] = data["ts"]
+
+    for msg in _parse_updates(config, data.get("updates", [])):
+        bus.messages.append(msg)
+        bus.last = msg
+        bus.total += 1
+        log.info("VK: новое сообщение от %s (%s): %s",
+                 msg["from_name"], msg["from_id"], msg["text"])
+
+
+
+#======================================================================
+# FILE: orchestrator.py
+#======================================================================
+﻿"""Оркестратор — тупой список шагов. Только вызовы."""
+from modules import vk
+
+
+def step(config):
+    # Шаг 1: модуль ВКонтакте
+    vk.step(config)
+
+    # (в будущем) Шаг 2: модуль базы данных
+    # db.step(config)
+
+    # (в будущем) Шаг 3: модуль веб-сервера
+    # web.step(config)
+
